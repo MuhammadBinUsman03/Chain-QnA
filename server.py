@@ -1,6 +1,8 @@
 #!/usr/bin/env python
-
+from dotenv import load_dotenv
+import os
 from operator import itemgetter
+from pydantic import BaseModel as BM
 from typing import List
 from langchain_core.runnables import (
     RunnableLambda,
@@ -15,12 +17,23 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langserve import add_routes
 from langchain_core.documents import Document
-import os
 from langchain_fireworks import ChatFireworks
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import SystemMessage,HumanMessage,BaseMessage, AIMessage, trim_messages
+from langchain_core.messages import SystemMessage,HumanMessage,BaseMessage, AIMessage, trim_messages, AIMessageChunk
+from langchain_cohere import CohereEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain import hub
 
+
+load_dotenv()
+app = FastAPI(
+  title="LangChain Server",
+  version="1.0",
+  description="A simple API server using LangChain's Runnable interfaces",
+)
+model = ChatFireworks(model="accounts/fireworks/models/mixtral-8x7b-instruct")
 
 class InMemoryHistory(BaseChatMessageHistory, BaseModel):
     """In memory implementation of chat message history."""
@@ -70,18 +83,14 @@ class InMemoryHistory(BaseChatMessageHistory, BaseModel):
             raise ValueError(f"Got unexpected message type: {_type}")
 
 
+# Store session history based on user_id and corresponding conversation_id
 store = {}
 def get_session_history(user_id: str, conversation_id: str) -> BaseChatMessageHistory:
     if (user_id, conversation_id) not in store:
         store[(user_id, conversation_id)] = InMemoryHistory()
     return store[(user_id, conversation_id)]
 
-# history = get_session_history("1", "1")
-# history.add_message(SystemMessage(content="You are a helpful assistant."))
 
-
-os.environ["FIREWORKS_API_KEY"] = 'G0A4kdyDVZ8O5Mm2whtTYiRRM4tbBSwczyyGT17RcK4UHgWB'
-model = ChatFireworks(model="accounts/fireworks/models/mixtral-8x7b-instruct")
 
 prompt = ChatPromptTemplate.from_messages(
     [
@@ -95,10 +104,9 @@ prompt = ChatPromptTemplate.from_messages(
 )
 
 def fake_retriever(query):
-    # assert isinstance(query, str)
     return [
-        Document(page_content="cats are the answer"),
-        Document(page_content="CAT POWERS"),
+        Document(page_content="________"),
+        Document(page_content="____"),
     ]
 
 
@@ -107,9 +115,8 @@ fake_retriever = RunnableLambda(fake_retriever)
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-parser = StrOutputParser()
 trimmer = trim_messages(
-    max_tokens=65,
+    max_tokens=2048,
     strategy="last",
     token_counter=model,
     include_system=True,
@@ -117,6 +124,8 @@ trimmer = trim_messages(
     start_on="human",
 )
 
+# parser = StrOutputParser()
+########## Q/A Chain ##############
 context = itemgetter("question") | fake_retriever | format_docs
 first_step = RunnablePassthrough.assign(context= context)
 
@@ -124,11 +133,12 @@ first_step = RunnablePassthrough.assign(context= context)
 # chain = first_step | prompt | model | parser
 
 ## With trimming, no streaming
-chain = first_step | RunnablePassthrough.assign(messages=itemgetter("history") | trimmer) | prompt | model | parser
+# chain = first_step | RunnablePassthrough.assign(messages=itemgetter("history") | trimmer) | prompt | model | parser
 
 ## for streaming on client side
-# chain = first_step | RunnablePassthrough.assign(messages=itemgetter("history") | trimmer) | prompt | model
+chain = first_step | RunnablePassthrough.assign(messages=itemgetter("history") | trimmer) | prompt | model
 
+# Pack Q/A chain in the Message History Runnable
 with_message_history = RunnableWithMessageHistory(
     chain,
     get_session_history=get_session_history,
@@ -153,14 +163,39 @@ with_message_history = RunnableWithMessageHistory(
         ),
     ],
 )
+#######################################################33
 
-app = FastAPI(
-  title="LangChain Server",
-  version="1.0",
-  description="A simple API server using LangChain's Runnable interfaces",
+# Doc chunking
+class Item(BM):
+    text: str
+
+# Dummy retriever, globally modified upon post request
+retriever = Chroma.from_documents(documents=[Document(page_content='___'), Document(page_content='___')], embedding=CohereEmbeddings()).as_retriever(search_type="similarity", search_kwargs={"k": 2})
+
+@app.post("/chunk/")
+async def getRetriever(item: Item):
+    '''Recieves PDF document content, creates chunks, dumps in chromaDB and prepares a retriever for rag chain'''
+    global retriever, RecursiveCharacterTextSplitter, Chroma
+    text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=100,
+    length_function=len
+    )
+    chunks = text_splitter.split_text(item.text)
+    vectorstore = Chroma.from_texts(texts=chunks, embedding=CohereEmbeddings())
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 2})
+ 
+
+############## RAG Chain ##########################
+rag_prompt = hub.pull("rlm/rag-prompt")
+rag_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | rag_prompt
+    | model
 )
+###################################################
 
-# 5. Adding chain route
+#  Q/A chain route
 add_routes(
     app,
     with_message_history,
@@ -168,8 +203,15 @@ add_routes(
     enable_feedback_endpoint=True
 )
 
+#  RAG chain route
+add_routes(
+    app,
+    rag_chain,
+    path="/rag_chain",
+    enable_feedback_endpoint=True
+)
+
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="localhost", port=8000)
 
